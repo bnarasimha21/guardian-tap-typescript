@@ -15,8 +15,9 @@ export interface AttachOptions {
 /**
  * Attach a GuardianAI observer to an Express app.
  *
- * Just call attachObserver(app) after creating your Express app.
- * No other changes needed. app.listen() continues to work as before.
+ * Intercepts res.json(), res.send(), and res.write() (SSE).
+ * All outgoing messages are broadcast to connected observers
+ * with request context (path, method, timestamp).
  *
  * @param app - Express application instance
  * @param options - Configuration options

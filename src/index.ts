@@ -12,11 +12,13 @@ import type { Express, Request, Response, NextFunction } from "express";
 import { createServer, Server as HttpServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 
+const VERSION = "0.1.0";
+
 /** Set of connected observer WebSocket clients */
 const observers = new Set<WebSocket>();
 
 /** Broadcast a JSON string to all connected observers */
-function broadcast(text: string): void {
+function broadcastRaw(text: string): void {
   if (observers.size === 0) return;
   const dead: WebSocket[] = [];
   for (const obs of observers) {
@@ -33,6 +35,19 @@ function broadcast(text: string): void {
   for (const d of dead) observers.delete(d);
 }
 
+/** Broadcast a dict wrapped in a tap envelope with request context */
+function broadcastWithContext(
+  data: Record<string, unknown>,
+  path: string = "",
+  method: string = ""
+): void {
+  const envelope = {
+    _tap: { path, method, timestamp: Date.now() / 1000 },
+    ...data,
+  };
+  broadcastRaw(JSON.stringify(envelope));
+}
+
 /** Try to parse a string as a JSON object */
 function tryParseJson(text: string): Record<string, unknown> | null {
   try {
@@ -46,8 +61,8 @@ function tryParseJson(text: string): Record<string, unknown> | null {
 }
 
 /** Extract JSON events from an SSE chunk */
-function extractSseEvents(chunk: string): string[] {
-  const events: string[] = [];
+function extractSseEvents(chunk: string): Record<string, unknown>[] {
+  const events: Record<string, unknown>[] = [];
   let currentEventType: string | null = null;
 
   for (const line of chunk.split("\n")) {
@@ -59,12 +74,12 @@ function extractSseEvents(chunk: string): string[] {
       const parsed = tryParseJson(dataStr);
       if (parsed) {
         if (!("type" in parsed) && currentEventType) {
-          events.push(JSON.stringify({ type: currentEventType, data: parsed }));
+          events.push({ type: currentEventType, data: parsed });
         } else {
-          events.push(JSON.stringify(parsed));
+          events.push(parsed);
         }
       } else if (currentEventType && dataStr) {
-        events.push(JSON.stringify({ type: currentEventType, data: { raw: dataStr } }));
+        events.push({ type: currentEventType, data: { raw: dataStr } });
       }
       currentEventType = null;
     }
@@ -80,8 +95,9 @@ export interface AttachOptions {
 /**
  * Attach a GuardianAI observer to an Express app.
  *
- * Just call attachObserver(app) after creating your Express app.
- * No other changes needed. app.listen() continues to work as before.
+ * Intercepts res.json(), res.send(), and res.write() (SSE).
+ * All outgoing messages are broadcast to connected observers
+ * with request context (path, method, timestamp).
  *
  * @param app - Express application instance
  * @param options - Configuration options
@@ -91,13 +107,14 @@ export function attachObserver(
   options: AttachOptions = {}
 ): void {
   const wsPath = options.path || "/ws-observe";
+  let listenCalled = false;
 
   // Health check endpoint (HTTP GET)
   app.get(wsPath, (_req, res) => {
     res.json({
       status: "ok",
       guardian_tap: true,
-      version: "0.1.0",
+      version: VERSION,
       framework: "express",
       observers: observers.size,
       websocket_support: true,
@@ -108,10 +125,13 @@ export function attachObserver(
   const originalListen = app.listen.bind(app);
 
   (app as any).listen = function (...args: any[]): HttpServer {
-    // Create HTTP server from the Express app
-    const server = createServer(app);
+    // Guard against multiple listen calls
+    if (listenCalled) {
+      return (originalListen as any)(...args);
+    }
+    listenCalled = true;
 
-    // Attach WebSocket server for observers
+    const server = createServer(app);
     const wss = new WebSocketServer({ server, path: wsPath });
 
     wss.on("connection", (ws: WebSocket) => {
@@ -128,22 +148,28 @@ export function attachObserver(
       });
     });
 
-    // Call server.listen with the same arguments
     return (server.listen as any)(...args);
   };
 
-  // Middleware to intercept SSE and JSON responses
+  // Middleware to intercept responses
   app.use((req: Request, res: Response, next: NextFunction) => {
     if (observers.size === 0) {
       next();
       return;
     }
 
+    const reqPath = req.path;
+    const reqMethod = req.method;
+
+    // Dedup guard: prevent double-broadcast from res.json -> res.send chain
+    let alreadyBroadcast = false;
+
     // Intercept res.json()
     const originalJson = res.json.bind(res);
     res.json = function (body: unknown): Response {
-      if (body && typeof body === "object") {
-        broadcast(JSON.stringify(body));
+      if (body && typeof body === "object" && !alreadyBroadcast) {
+        alreadyBroadcast = true;
+        broadcastWithContext(body as Record<string, unknown>, reqPath, reqMethod);
       }
       return originalJson(body);
     };
@@ -151,25 +177,37 @@ export function attachObserver(
     // Intercept res.send() for string/JSON payloads
     const originalSend = res.send.bind(res);
     res.send = function (body: any): Response {
-      if (body && typeof body === "string" && observers.size > 0) {
+      if (!alreadyBroadcast && body && typeof body === "string" && observers.size > 0) {
         const parsed = tryParseJson(body);
         if (parsed) {
-          broadcast(JSON.stringify(parsed));
+          alreadyBroadcast = true;
+          broadcastWithContext(parsed, reqPath, reqMethod);
         }
       }
       return originalSend(body);
     };
 
-    // Intercept res.write() - detect SSE data lines automatically
+    // Intercept res.write() - detect SSE data lines and Buffer chunks
     const originalWrite = res.write.bind(res);
 
     res.write = function (chunk: any, ...args: any[]): boolean {
       if (observers.size > 0) {
-        const text = typeof chunk === "string" ? chunk : chunk?.toString?.("utf-8") || "";
+        let text: string | null = null;
+
+        if (typeof chunk === "string") {
+          text = chunk;
+        } else if (Buffer.isBuffer(chunk)) {
+          try {
+            text = chunk.toString("utf-8");
+          } catch {
+            // Not valid UTF-8, skip
+          }
+        }
+
         if (text && text.includes("data:")) {
           const events = extractSseEvents(text);
           for (const event of events) {
-            broadcast(event);
+            broadcastWithContext(event, reqPath, reqMethod);
           }
         }
       }
@@ -179,10 +217,10 @@ export function attachObserver(
     next();
   });
 
-  console.log(`[guardian-tap] Attached at ${wsPath} (express + sse)`);
+  console.log(`[guardian-tap] Attached at ${wsPath} (express + sse + json)`);
 }
 
 /** Manually broadcast a JSON payload to all observers */
 export function broadcastEvent(data: Record<string, unknown>): void {
-  broadcast(JSON.stringify(data));
+  broadcastRaw(JSON.stringify(data));
 }
