@@ -133,20 +133,12 @@ function attachObserver(app, options = {}) {
             }
             return originalJson(body);
         };
-        // Intercept res.write() for SSE streams
+        // Intercept res.write() - detect SSE data lines automatically
         const originalWrite = res.write.bind(res);
-        let isSse = false;
-        const originalSetHeader = res.setHeader.bind(res);
-        res.setHeader = function (name, value) {
-            if (name.toLowerCase() === "content-type" && String(value).includes("text/event-stream")) {
-                isSse = true;
-            }
-            return originalSetHeader(name, value);
-        };
         res.write = function (chunk, ...args) {
-            if (isSse && observers.size > 0) {
+            if (observers.size > 0) {
                 const text = typeof chunk === "string" ? chunk : chunk?.toString?.("utf-8") || "";
-                if (text) {
+                if (text && text.includes("data:")) {
                     const events = extractSseEvents(text);
                     for (const event of events) {
                         broadcast(event);
