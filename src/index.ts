@@ -92,6 +92,18 @@ export function attachObserver(
 ): void {
   const wsPath = options.path || "/ws-observe";
 
+  // Health check endpoint (HTTP GET)
+  app.get(wsPath, (_req, res) => {
+    res.json({
+      status: "ok",
+      guardian_tap: true,
+      version: "0.1.0",
+      framework: "express",
+      observers: observers.size,
+      websocket_support: true,
+    });
+  });
+
   // Patch app.listen to create an HTTP server with WebSocket support
   const originalListen = app.listen.bind(app);
 
