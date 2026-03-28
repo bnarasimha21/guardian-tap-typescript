@@ -133,6 +133,17 @@ function attachObserver(app, options = {}) {
             }
             return originalJson(body);
         };
+        // Intercept res.send() for string/JSON payloads
+        const originalSend = res.send.bind(res);
+        res.send = function (body) {
+            if (body && typeof body === "string" && observers.size > 0) {
+                const parsed = tryParseJson(body);
+                if (parsed) {
+                    broadcast(JSON.stringify(parsed));
+                }
+            }
+            return originalSend(body);
+        };
         // Intercept res.write() - detect SSE data lines automatically
         const originalWrite = res.write.bind(res);
         res.write = function (chunk, ...args) {
