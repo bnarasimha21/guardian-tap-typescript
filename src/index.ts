@@ -2,19 +2,15 @@
  * guardian-tap: One-line integration to make any Express app observable by GuardianAI.
  *
  * Usage:
- *   const { attachObserver } = require('guardian-tap');
- *   attachObserver(app);
- *
- * Or with ES modules:
  *   import { attachObserver } from 'guardian-tap';
  *   attachObserver(app);
+ *
+ * That's it. No other changes needed. app.listen() works as before.
  */
 
 import type { Express, Request, Response, NextFunction } from "express";
 import { createServer, Server as HttpServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
-
-const SSE_DATA_RE = /^data:\s*(.+)$/gm;
 
 /** Set of connected observer WebSocket clients */
 const observers = new Set<WebSocket>();
@@ -34,9 +30,7 @@ function broadcast(text: string): void {
       dead.push(obs);
     }
   }
-  for (const d of dead) {
-    observers.delete(d);
-  }
+  for (const d of dead) observers.delete(d);
 }
 
 /** Try to parse a string as a JSON object */
@@ -86,40 +80,45 @@ export interface AttachOptions {
 /**
  * Attach a GuardianAI observer to an Express app.
  *
- * This does three things:
- * 1. Creates a WebSocket server at /ws-observe for observers to connect to
- * 2. Intercepts SSE responses (text/event-stream) and broadcasts events to observers
- * 3. Intercepts res.json() calls and broadcasts them to observers
+ * Just call attachObserver(app) after creating your Express app.
+ * No other changes needed. app.listen() continues to work as before.
  *
  * @param app - Express application instance
  * @param options - Configuration options
- * @returns The HTTP server (use this instead of app.listen())
  */
 export function attachObserver(
   app: Express,
   options: AttachOptions = {}
-): HttpServer {
+): void {
   const wsPath = options.path || "/ws-observe";
 
-  // Create HTTP server from Express app
-  const server = createServer(app);
+  // Patch app.listen to create an HTTP server with WebSocket support
+  const originalListen = app.listen.bind(app);
 
-  // Create WebSocket server on the same HTTP server
-  const wss = new WebSocketServer({ server, path: wsPath });
+  (app as any).listen = function (...args: any[]): HttpServer {
+    // Create HTTP server from the Express app
+    const server = createServer(app);
 
-  wss.on("connection", (ws: WebSocket) => {
-    observers.add(ws);
-    console.log(`[guardian-tap] Observer connected (${observers.size} total)`);
+    // Attach WebSocket server for observers
+    const wss = new WebSocketServer({ server, path: wsPath });
 
-    ws.on("close", () => {
-      observers.delete(ws);
-      console.log(`[guardian-tap] Observer disconnected (${observers.size} remaining)`);
+    wss.on("connection", (ws: WebSocket) => {
+      observers.add(ws);
+      console.log(`[guardian-tap] Observer connected (${observers.size} total)`);
+
+      ws.on("close", () => {
+        observers.delete(ws);
+        console.log(`[guardian-tap] Observer disconnected (${observers.size} remaining)`);
+      });
+
+      ws.on("error", () => {
+        observers.delete(ws);
+      });
     });
 
-    ws.on("error", () => {
-      observers.delete(ws);
-    });
-  });
+    // Call server.listen with the same arguments
+    return (server.listen as any)(...args);
+  };
 
   // Middleware to intercept SSE and JSON responses
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -141,7 +140,6 @@ export function attachObserver(
     const originalWrite = res.write.bind(res);
     let isSse = false;
 
-    // Intercept writeHead/setHeader to detect SSE
     const originalSetHeader = res.setHeader.bind(res);
     res.setHeader = function (name: string, value: string | number | readonly string[]): Response {
       if (name.toLowerCase() === "content-type" && String(value).includes("text/event-stream")) {
@@ -167,8 +165,6 @@ export function attachObserver(
   });
 
   console.log(`[guardian-tap] Attached at ${wsPath} (express + sse)`);
-
-  return server;
 }
 
 /** Manually broadcast a JSON payload to all observers */
